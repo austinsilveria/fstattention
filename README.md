@@ -6,6 +6,7 @@ Memory bandwidth efficient sparse tree attention
 - (precompute) compute unique ancestors, attention mask, and leaves for each block
 - (runtime) only load keys and values for the query block's unique ancestors and leaves
 - (runtime) go fast
+- [A100 Colab Benchmark](https://colab.research.google.com/drive/12MvLU5TUMAARQAUVYN2VL0u24A8MwsFI?usp=sharing)
 
 go forth, search the tree of possible futures
 
