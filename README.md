@@ -16,6 +16,9 @@ Notes on precomputation:
   - Can probably make this fast enough for runtime with a bit more work since for a dynamic tree structure (i.e. dependent on the model's output), we only need to compute these kernel inputs once, and then they get reused by all attention layers in the model
   - Static tree structures are still useful: [Medusa](https://arxiv.org/pdf/2401.10774.pdf) uses a size 256 static left weighted tree that gets populated via cartesian products of their multiple topk output heads to accelerate batch size 1 inference by ~3x
 
+Todo:
+- [ ] Organize blocks based on DFS odering to minimize the number of blocks that need to load the same ancestor KVs (i.e. maximize the shared lineage of each block)
+
 Credits:
 - [OpenAI kernel team's flash 2 triton implementation](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html)
 - [Original flash attention paper](https://arxiv.org/abs/2205.14135)
