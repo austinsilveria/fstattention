@@ -23,6 +23,7 @@ def _fwd_kernel(Q, K, V,
                 ANCESTOR_IDX,  # [NUM_M_BLOCKS, MAX_ANCESTORS]    - Unique ancestors attended to by queries in this block
                 ANCESTOR_MASK, # [NUM_M_BLOCKS, M, MAX_ANCESTORS] - Attention mask applied to q[m]*ancestor_idxs[m]
                 LEAF_IDX,      # [NUM_M_BLOCKS, M]                - Indices of leaf nodes in this block
+                shared_prefix_length,
                 sm_scale,  #
                 L,  #
                 Out,  #
@@ -76,8 +77,6 @@ def _fwd_kernel(Q, K, V,
 
     q = (q * qk_scale).to(K.dtype.element_ty)
     # Tree - compute ancestor attention weights
-    #        (can think about including attention to shared prefix later--queries already batched,
-    #         but there are potential tradeoffs with parallel KV loading like FlashDecoding)
     ancestor_kv_load_mask = ancestor_idx != -1
     k = tl.load(K_ptrs, mask=ancestor_kv_load_mask[None, :], other=0)
     qk = tl.zeros([BLOCK_M, MAX_ANCESTORS], dtype=tl.float32)
@@ -86,9 +85,9 @@ def _fwd_kernel(Q, K, V,
 
     # Tree - compute leaf self attention weights
     leaf_kv_load_mask = leaf_idx != -1
-    K_ptrs = K + vk_offset + leaf_idx[:, None] * stride_kn + offs_k[None, :] * stride_kk 
-    k = tl.load(K_ptrs, mask=leaf_kv_load_mask[:, None], other=0)
-    lqk = tl.sum(q * k, 1)
+    lK_ptrs = K + vk_offset + leaf_idx[:, None] * stride_kn + offs_k[None, :] * stride_kk 
+    lk = tl.load(lK_ptrs, mask=leaf_kv_load_mask[:, None], other=0)
+    lqk = tl.sum(q * lk, 1)
     lqk = tl.where(leaf_kv_load_mask, lqk, float("-inf"))
 
     # # -- compute scaling constant ---
@@ -103,13 +102,38 @@ def _fwd_kernel(Q, K, V,
     acc += tl.dot(p.to(V.dtype.element_ty), v, allow_tf32=True)
 
     # Tree - compute attention weighted leaf values
-    V_ptrs = V + vk_offset + leaf_idx[:, None] * stride_vn + offs_k[None, :] * stride_vk
-    v = tl.load(V_ptrs, mask=leaf_kv_load_mask[:, None], other=0)
-    acc += lp.to(V.dtype.element_ty)[:, None] * v
+    lV_ptrs = V + vk_offset + leaf_idx[:, None] * stride_vn + offs_k[None, :] * stride_vk
+    lv = tl.load(lV_ptrs, mask=leaf_kv_load_mask[:, None], other=0)
+    acc += lp.to(V.dtype.element_ty)[:, None] * lv
 
     # -- update m_i and l_i --
     l_i = l_i * alpha + tl.sum(p, 1) + lp
     m_i = m_i_new
+
+    # shared prefix attention
+    lo = 0
+    hi = shared_prefix_length
+    for start_n in range(lo, hi, MAX_ANCESTORS):
+        block_n = start_n + offs_n
+        # -- load k, v --
+        K_ptrs = K + vk_offset + offs_k[:, None] * stride_kk + block_n[None, :] * stride_kn
+        V_ptrs = V + vk_offset + block_n[:, None] * stride_vn + offs_k[None, :] * stride_vk
+        k = tl.load(K_ptrs)
+        v = tl.load(V_ptrs)
+        # -- compute qk ---
+        qk = tl.zeros([BLOCK_M, MAX_ANCESTORS], dtype=tl.float32)
+        qk += tl.dot(q, k, allow_tf32=True)
+        # -- compute scaling constant ---
+        m_i_new = tl.maximum(m_i, tl.max(qk, 1))
+        alpha = tl.math.exp2(m_i - m_i_new)
+        p = tl.math.exp2(qk - m_i_new[:, None])
+        # -- scale and update acc --
+        acc *= alpha[:, None]
+        acc += tl.dot(p.to(V.dtype.element_ty), v, allow_tf32=True)
+
+        # -- update m_i and l_i --
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_i_new
 
     # write back l and m
     acc = acc / l_i[:, None]
@@ -135,8 +159,10 @@ def fst_attention(q, k, v, ancestor_idx, ancestor_mask, leaf_idx, sm_scale, BLOC
     grid = (cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
     L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
     num_warps = 4 if Lk <= 64 else 8
+
+    shared_prefix_length = k.shape[2] - q.shape[2]
     _fwd_kernel[grid](
-        q, k, v, ancestor_idx, ancestor_mask, leaf_idx, sm_scale,  #
+        q, k, v, ancestor_idx, ancestor_mask, leaf_idx, shared_prefix_length, sm_scale,  #
         L,  #
         o,  #
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
@@ -154,38 +180,51 @@ def fst_attention(q, k, v, ancestor_idx, ancestor_mask, leaf_idx, sm_scale, BLOC
     )
     return o
 
-def test_op(Z, H, N_CTX, D_HEAD, causal, dtype=torch.float16):
+def test_op(Z, H, N_CTX, D_HEAD, shared_kv_prefix=True, dtype=torch.float16):
     torch.manual_seed(20)
+    # Query tree of size N_CTX
     q = (torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
-    k = (torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
-    v = (torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    if shared_kv_prefix:
+      # KV tree of size N_CTX + fully shared (by all tree queries) KV prefix of size N_CTX
+      k = (torch.empty((Z, H, 2 * N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+      v = (torch.empty((Z, H, 2 * N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    else:
+      k = (torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+      v = (torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
     sm_scale = 0.5
 
     lineage, level_lookup = create_tree(depth=DEPTH_MAPPING[N_CTX])
     full_mask = create_full_attention_mask(lineage)
     BLOCK_M = 128
     MAX_ANCESTORS = MAX_ANCESTOR_MAPPING[N_CTX]
-    ancestor_idx, ancestor_mask, leaf_idxs = create_fst_attention_kernel_inputs(
+    ancestor_idx, ancestor_mask, leaf_idx = create_fst_attention_kernel_inputs(
         lineage,
         level_lookup,
         block_m=BLOCK_M,
         max_ancestors=MAX_ANCESTORS
     )
 
+    if shared_kv_prefix:
+      # Full attention to shared prefix
+      full_mask = torch.cat((torch.ones((N_CTX, N_CTX), dtype=torch.bool), full_mask), dim=1)
+      # Shift to account for the shared prefix
+      ancestor_idx += N_CTX
+      leaf_idx += N_CTX
+
     # reference implementation
     M = full_mask.to('cuda')
     p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-    if causal:
-        p[:, :, M == 0] = float("-inf")
+    p[:, :, M == 0] = float("-inf")
     p = torch.softmax(p.float(), dim=-1).half()
     ref_out = torch.matmul(p, v)
 
     # triton implementation
     ancestor_idx = ancestor_idx.to('cuda')
     ancestor_mask = ancestor_mask.to('cuda')
-    leaf_idx = leaf_idxs.to('cuda')
+    leaf_idx = leaf_idx.to('cuda')
     tri_out = fst_attention(q, k, v, ancestor_idx, ancestor_mask, leaf_idx, sm_scale).half()
-    # compare
+
+    # compare (ignore last 4 since we added padding)
     assert torch.allclose(ref_out[:, :, :-4], tri_out[:, :, :-4], atol=1e-2, rtol=0)
 
 
@@ -256,5 +295,6 @@ def bench_flash_attention(BATCH, H, N_CTX, D_HEAD, causal, mode, provider, dtype
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
     return ms
 
-test_op(2, 2, 2**10, 64, True)
+test_op(2, 2, 2**11, 64, shared_kv_prefix=True)
+test_op(2, 2, 2**11, 64, shared_kv_prefix=False)
 bench_flash_attention.run(save_path=".", print_data=True)
